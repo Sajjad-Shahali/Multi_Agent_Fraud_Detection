@@ -1,0 +1,14 @@
+# Langfuse credentials
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_HOST=https://challenges.reply.com/langfuse
+
+# OpenRouter API key
+OPENROUTER_API_KEY=sk-or-...
+
+# Team name (spaces will be replaced with "-" in session IDs)
+TEAM_NAME=your-team-name
+
+# Do not edit. Disables media upload for langfuse (traces still work). 
+# Turning it on will show errors during the execution of the code.
+LANGFUSE_MEDIA_UPLOAD_ENABLED=false
