@@ -1,5 +1,25 @@
 # Multi-Agent Fraud Detection System
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776ab.svg)](https://www.python.org/)
+[![LangGraph](https://img.shields.io/badge/LangGraph-1.1.6-1c7c54.svg)](https://github.com/langchain-ai/langgraph)
+[![LangChain](https://img.shields.io/badge/LangChain-1.2.15-1c7c54.svg)](https://github.com/langchain-ai/langchain)
+[![LangSmith](https://img.shields.io/badge/LangSmith-0.7.32-1c7c54.svg)](https://smith.langchain.com/)
+[![Langfuse](https://img.shields.io/badge/Langfuse-3.14.6-6b21a8.svg)](https://langfuse.com)
+[![OpenAI](https://img.shields.io/badge/OpenAI-via%20OpenRouter-412991.svg)](https://openrouter.ai)
+[![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-1.41.0-f5a800.svg)](https://opentelemetry.io/)
+[![NumPy](https://img.shields.io/badge/NumPy-2.4.4-013243.svg)](https://numpy.org/)
+[![Pandas](https://img.shields.io/badge/Pandas-3.0.2-150458.svg)](https://pandas.pydata.org/)
+[![scikit-learn](https://img.shields.io/badge/scikit--learn-1.8.0-f7931e.svg)](https://scikit-learn.org/)
+[![SciPy](https://img.shields.io/badge/SciPy-1.17.1-8caae6.svg)](https://scipy.org/)
+[![spaCy](https://img.shields.io/badge/spaCy-3.8.14-09a3d5.svg)](https://spacy.io/)
+[![Haversine](https://img.shields.io/badge/Haversine-2.9.0-4b5563.svg)](https://pypi.org/project/haversine/)
+[![Pydantic](https://img.shields.io/badge/Pydantic-2.13.1-e92063.svg)](https://docs.pydantic.dev/)
+[![Rich](https://img.shields.io/badge/Rich-15.0.0-ff6600.svg)](https://github.com/Textualize/rich)
+[![tqdm](https://img.shields.io/badge/tqdm-4.67.3-ffc107.svg)](https://tqdm.github.io/)
+[![python-dotenv](https://img.shields.io/badge/python--dotenv-1.2.2-ecd53f.svg)](https://pypi.org/project/python-dotenv/)
+[![pytest](https://img.shields.io/badge/pytest-9.0.3-0a9edc.svg)](https://pytest.org/)
+
 **Reply Mirror Hackathon — Problem Statement 16 April 2026**
 
 A production-quality multi-agent fraud detection pipeline built on LangGraph that combines deterministic feature engineering with LLM-powered reasoning to detect Business Email Compromise (BEC) and payment-redirect fraud in a fictional banking dataset.
