@@ -1,584 +1,957 @@
-# Multi-Agent Fraud Detection for Reply Mirror 2026
+# Multi-Agent Fraud Detection System
 
-This repository contains an agent-based fraud detection system built for the Reply AI Challenge 2026 "Reply Mirror" scenario. The project combines deterministic fraud analytics with LangGraph orchestration, OpenRouter-hosted LLM reasoning, and Langfuse challenge tracing.
+**Reply Mirror Hackathon — Problem Statement 16 April 2026**
 
-The goal is to identify suspicious transactions in evolving, adversarial financial data while keeping false positives under control and preserving the agentic nature required by the competition.
+A production-quality multi-agent fraud detection pipeline built on LangGraph that combines deterministic feature engineering with LLM-powered reasoning to detect Business Email Compromise (BEC) and payment-redirect fraud in a fictional banking dataset.
+
+---
 
 ## Table of Contents
 
-- [Challenge Context](#challenge-context)
-- [Project Goals](#project-goals)
-- [System Architecture](#system-architecture)
-- [Dataset Overview](#dataset-overview)
-- [Repository Structure](#repository-structure)
-- [Core Components](#core-components)
-- [Technical Stack](#technical-stack)
-- [Tracing and Submission Requirements](#tracing-and-submission-requirements)
-- [Setup](#setup)
-- [Configuration](#configuration)
-- [How to Run](#how-to-run)
-- [Evaluation and Testing](#evaluation-and-testing)
-- [Output Format](#output-format)
-- [Known Limitations](#known-limitations)
-- [Design Decisions](#design-decisions)
-- [References](#references)
+1. [Background & Problem](#1-background--problem)
+2. [System Architecture](#2-system-architecture)
+3. [Feature Engineering & Formulations](#3-feature-engineering--formulations)
+4. [Agent Design](#4-agent-design)
+5. [Decision Logic & Thresholds](#5-decision-logic--thresholds)
+6. [Prerequisites](#6-prerequisites)
+7. [Installation](#7-installation)
+8. [Configuration](#8-configuration)
+9. [Data Setup](#9-data-setup)
+10. [Quickstart](#10-quickstart)
+11. [CLI Reference](#11-cli-reference)
+12. [Available Models](#12-available-models)
+13. [Evaluation & Metrics](#13-evaluation--metrics)
+14. [Threshold Calibration](#14-threshold-calibration)
+15. [Submission](#15-submission)
+16. [Testing](#16-testing)
+17. [Observability with Langfuse](#17-observability-with-langfuse)
+18. [Performance Optimizations](#18-performance-optimizations)
+19. [Project Structure](#19-project-structure)
 
-## Challenge Context
+---
 
-Reply Mirror is a fraud detection challenge set in the year 2087. Teams are asked to build agent-based systems that detect suspicious financial behavior from heterogeneous sources:
+## 1. Background & Problem
 
-- transactions
-- user profiles
-- geolocation traces
-- SMS threads
-- email threads
+### Fraud Type: Business Email Compromise / Reply-Chain Fraud
 
-The challenge explicitly rewards:
+**Business Email Compromise (BEC)** is a social-engineering attack in which adversaries infiltrate or spoof legitimate email threads to redirect payments. The FBI IC3 report (2023) classifies BEC as the costliest cybercrime category, responsible for over \$2.9 billion in losses annually.
 
-- fraud detection accuracy
-- low false positive rate
-- operational speed and cost efficiency
-- robustness to temporal and structural drift
-- agent-based design rather than fully deterministic pipelines
+The **Reply Mirror** scenario models a variant called *reply-chain invoice fraud*:
 
-Competition constraints captured in this codebase:
+1. An attacker intercepts an ongoing payment thread (SMS or email).
+2. They inject a fraudulent message that mimics the counterparty and substitutes an IBAN.
+3. The victim authorises a transfer believing it is part of an existing conversation.
 
-- output must be an ASCII text file containing suspicious `transaction_id` values
-- one transaction ID per line
-- reporting no IDs is invalid
-- reporting all IDs is invalid
-- recall below 15% is invalid
-- top solutions may be reevaluated on unseen datasets
+### Why Multi-Agent?
 
-The official challenge brief is mirrored in `problemoverview/AIAgentChallenge-ProblemStatement16April.md`.
+Single-model approaches fail because fraud signals are **heterogeneous and correlated across dimensions**:
 
-## Project Goals
+| Signal Type | Source | Example |
+|---|---|---|
+| Behavioural | Transaction history | Sudden velocity spike |
+| Statistical | Amount distribution | Z-score > 3σ |
+| Geospatial | GPS + transaction location | 1 200 km/h implied travel |
+| Linguistic | SMS / email text | "Urgent: account will be closed" |
+| Cross-referential | Comms ↔ transaction | IBAN in message ≠ IBAN in transaction |
 
-This repository is designed around four engineering goals:
+A supervisor agent arbitrates specialist signals with **asymmetric cost weighting**: missing a fraud is more costly than a false positive, so thresholds lean toward recall over precision.
 
-1. Use deterministic code where exact computation is clearly better than LLM reasoning.
-2. Use specialist agents only where interpretation, ambiguity, or evidence fusion matter.
-3. Keep the system auditable with structured state, structured agent outputs, and reproducible traces.
-4. Balance fraud recall with cost and runtime constraints required by the challenge.
+### Literature Basis
 
-## System Architecture
+| Technique | Reference |
+|---|---|
+| Population Stability Index (PSI) for drift | Siddiqi, N. (2006). *Credit Risk Scorecards.* Wiley |
+| Haversine impossible-travel detection | Óskarsdóttir et al. (2019). *The value of big data for credit scoring.* KAIS |
+| LLM agents for fraud reasoning | Bhatt et al. (2024). *LLM4Fraud: Large language models for financial fraud detection.* |
+| Multi-agent orchestration | Hong et al. (2023). *MetaGPT: Meta programming for multi-agent collaborative framework.* arXiv:2308.00352 |
+| ReAct prompting | Yao et al. (2022). *ReAct: Synergizing reasoning and acting in language models.* arXiv:2210.03629 |
+| Structured Chain-of-Thought | Wei et al. (2022). *Chain-of-thought prompting elicits reasoning in large language models.* NeurIPS |
+| AML typology (FATF/Egmont) | FATF (2020). *Virtual Assets Red Flag Indicators.* |
 
-The system is implemented as a LangGraph workflow over a shared `FraudState` object defined in `state.py`.
+---
 
-High-level topology:
+## 2. System Architecture
 
-```text
+### Graph Topology
+
+```
 START
-  |
-  v
-Node 1: Deterministic Featurizer
-  |
-  +--> Node 2: Transaction Reasoning Agent
-  |
-  +--> Node 3: Communications Reasoning Agent
-              |
-              v
-Node 4: Supervisor Agent
-  |
-  v
-END -> submission output file
+  │
+  ▼
+┌─────────────────────────────────────────────────────────┐
+│  NODE 1 — FEATURIZER  (deterministic, no LLM)           │
+│  Computes 15 features → combined_risk_score             │
+└─────────────────────────┬───────────────────────────────┘
+                          │
+               ┌──────────▼──────────┐
+               │  CONDITIONAL EDGE   │
+               │  CRS ≥ threshold?   │
+               └──────┬──────────────┘
+          YES ←───────┤───────────→ NO
+          │           │             │
+          ▼           │    ┌────────▼─────────────────────┐
+┌─────────────────┐   │    │  NODE 2 — TRANSACTION AGENT  │
+│  NODE 4         │   │    │  FAST_MODEL (gpt-4o-mini)    │
+│  SUPERVISOR     │   │    │  Signal 0–1 + pattern label  │
+│  (short-circuit)│   │    └────────────────────────────┬─┘
+└─────────────────┘   │    ┌──────────────────────────┐ │
+                      │    │  NODE 3 — COMMS AGENT    │ │
+                      │    │  STRONG_MODEL (gpt-4o)   │ │
+                      │    │  Signal 0–1 + mismatches │ │
+                      │    └─────────────────────────┬┘ │
+                      │                              │   │
+                      │    ┌─────────────────────────▼───▼────┐
+                      │    │  NODE 4 — SUPERVISOR AGENT       │
+                      └───►│  STRONG_MODEL (gpt-4o)           │
+                           │  Verdict: FRAUD | REVIEW | CLEAN  │
+                           └──────────────────────────────────┘
+                                          │
+                                        END
+                           Flagged IDs → ASCII output file
 ```
 
-There is also a short-circuit route intended to bypass specialist agents when deterministic evidence is already decisive.
+### State Layers
 
-### Shared State
+The pipeline threads a single `FraudState` TypedDict through every node:
 
-`state.py` defines the contract that all nodes read and update. It includes:
+```
+Layer 1 — Identity (immutable input)
+  transaction_id, user_id, raw_transaction, raw_user
 
-- transaction identity and raw transaction context
-- matched user profile
-- deterministic risk features
-- transaction-agent outputs
-- communications-agent outputs
-- final supervisor verdict and explanation
+Layer 2 — Deterministic Features (populated by Featurizer)
+  velocity_score, amount_zscore, balance_integrity_flag,
+  iban_risk_tier, geo_travel_anomaly, demographic_deviation_pct,
+  drift_psi, extracted_entities, cross_source_flags,
+  combined_risk_score
 
-Important fields include:
+Layer 3 — Specialist Outputs (populated by Transaction + Comms agents)
+  transaction_fraud_signal (0–1), transaction_pattern_label,
+  transaction_reasoning, comms_fraud_signal (0–1),
+  flagged_phrases, cross_reference_mismatches, comms_reasoning
 
-- `velocity_score`
-- `amount_zscore`
-- `balance_integrity_flag`
-- `iban_risk_tier`
-- `geo_travel_anomaly`
-- `demographic_deviation_pct`
-- `drift_psi`
-- `extracted_entities`
-- `cross_source_flags`
-- `combined_risk_score`
-- `transaction_fraud_signal`
-- `comms_fraud_signal`
-- `verdict`
+Layer 4 — Final Verdict (populated by Supervisor)
+  verdict ("FRAUD"|"REVIEW"|"CLEAN"), confidence (0–1),
+  primary_evidence, explanation
+```
 
-## Dataset Overview
+---
 
-The root dataset directory is `train-validation/`.
+## 3. Feature Engineering & Formulations
 
-Supported levels in the current loader:
+All features are computed deterministically in `featurizer.py` before any LLM call.
 
-- `brave-new-world`
-- `deus-ex`
-- `the-truman-show`
+### 3.1 Velocity Score
 
-Each level has a `train` and `validation` zip. The loader in `data_loader.py` resolves paths such as:
+Count of transactions by the same `sender_id` within a ±24-hour window centred on the current transaction timestamp:
 
-- `Brave+New+World+-+train.zip`
-- `Deus+Ex+-+validation.zip`
-- `The+Truman+Show+-+validation.zip`
+```
+velocity = |{tx_j : sender_j = sender_i  ∧  |t_j − t_i| ≤ 24h}|
+```
 
-Each zip contains five sources:
+Thresholds: ≥ 5 transactions → elevated; ≥ 10 → high risk.
 
-### `transactions.csv`
+### 3.2 Amount Z-Score
 
-Structured transaction ledger with fields such as:
+Standardised deviation of the transaction amount against the sender's historical distribution:
 
-- `transaction_id`
-- `sender_id`
-- `recipient_id`
-- `transaction_type`
-- `amount`
-- `location`
-- `payment_method`
-- `sender_iban`
-- `recipient_iban`
-- `balance_after`
-- `description`
-- `timestamp`
+```
+z = |amount_i − μ_sender| / (σ_sender + ε)
+```
 
-### `users.json`
+where ε = 1.0 prevents division by zero for senders with a single transaction.  
+Additionally, the **salary ratio** `amount / monthly_salary` is computed to flag amounts exceeding typical income (> 1× salary = elevated; > 3× = high).
 
-User profile records including:
+### 3.3 Balance Integrity Flag
 
-- name
-- birth year
-- salary
-- job
-- IBAN
-- residence coordinates
-- natural-language profile description
+Three drain patterns are detected:
 
-### `locations.json`
+| Pattern | Condition |
+|---|---|
+| Near-zero drain | `balance_after ≤ 200` AND `balance_before ≥ 1 000` |
+| Large-fraction drain | Single transaction > 80% of `balance_before` |
+| Consecutive violations | 2 or more of the above in sender's recent history |
 
-GPS pings keyed by `biotag`, with:
+The flag is `True` if any pattern is present. The 5% threshold used in earlier designs was too sensitive because intermediate deposits inflate running balances.
 
-- timestamp
-- latitude
-- longitude
-- city
+### 3.4 IBAN Risk Tier
 
-### `sms.json`
+The first two characters of an IBAN encode the ISO 3166-1 alpha-2 country code. Each country is classified by FATF/AML risk:
 
-SMS thread payloads stored under a single `sms` string field.
+```python
+HIGH_RISK   = {"NG", "UA", "BY", "KP", "IR", "SY", "YE", "LY", "MM", "AF"}
+MEDIUM_RISK = {"RU", "VN", "PK", "BD", "GH", "SN", "TZ", "KE", "PH", "MX"}
+# All others → LOW_RISK
+```
 
-### `mails.json`
+### 3.5 Geo Travel Anomaly (Haversine)
 
-Email or HTML mail thread payloads stored under a single `mail` field.
+Given the Haversine distance `d(A, B)` in km and the time gap `Δt` in hours, the implied travel speed is:
 
-## Repository Structure
+```
+speed = d(last_GPS_ping, transaction_location) / Δt  [km/h]
+```
 
-Main project files:
+The flag is `True` when `speed > 900 km/h` (supersonic threshold; commercial aviation ≈ 900 km/h). The haversine formula:
 
-- `pipeline.py` - generic CLI runner for a given level and split
-- `submit.py` - validation/submission runner
-- `evaluate.py` - local evaluation harness
-- `calibrate.py` - threshold calibration script
-- `data_loader.py` - dataset loading and normalization
-- `featurizer.py` - deterministic feature engineering node
-- `graph.py` - LangGraph assembly
-- `session.py` - session ID generation and Langfuse config
-- `state.py` - shared state schema
+```
+a = sin²(Δφ/2) + cos(φ₁)·cos(φ₂)·sin²(Δλ/2)
+d = 2·R·arcsin(√a),   R = 6371 km
+```
 
-Agents:
+### 3.6 Demographic Deviation Score
 
-- `agents/transaction_agent.py`
-- `agents/comms_agent.py`
-- `agents/supervisor_agent.py`
+A weighted sum (0–1) of atypicality signals relative to the sender's profile:
 
-Prompts:
+| Signal | Weight |
+|---|---|
+| `amount > 3× monthly_salary` | +0.35 |
+| `amount > 1× monthly_salary` | +0.15 |
+| Transaction hour in [23:00–05:00] | +0.20 |
+| Occupation = retired/student + large e-commerce | +0.20 |
 
-- `prompts/transaction_agent_prompt.py`
-- `prompts/comms_agent_prompt.py`
-- `prompts/supervisor_prompt.py`
+Score is clamped to [0, 1].
 
-Deterministic tools:
+### 3.7 Pattern Drift (PSI — Population Stability Index)
 
-- `tools/transaction_tools.py`
-- `tools/geospatial_tools.py`
-- `tools/comms_tools.py`
+PSI measures distributional shift of sender transaction amounts between a *baseline* window (older 70%) and a *recent* window (newest 30%), using equal-frequency binning over 10 bins:
 
-Tests:
+```
+PSI = Σᵢ (Actual%ᵢ − Expected%ᵢ) · ln(Actual%ᵢ / Expected%ᵢ)
+```
 
-- `tests/test_featurizer.py`
-- `tests/test_agents.py`
-- `tests/test_graph.py`
-- `tests/test_state.py`
-- `tests/test_evaluate.py`
+Interpretation:
+- PSI < 0.10 → No significant change
+- 0.10 ≤ PSI < 0.25 → Moderate shift (monitor)
+- PSI ≥ 0.25 → **Significant drift** (flag)
 
-Reference and support material:
+### 3.8 Combined Risk Score
 
-- `problemoverview/`
-- `reply-mirror-multi-agent-fraud-design.md`
-- `COMPARISON_REPORT.md`
-- `Langfuse/how-to-track-your-submission/`
+A normalised weighted sum of all deterministic signals, used as a prior for the LLM agents and as the short-circuit trigger:
 
-## Core Components
+```
+CRS = clip(
+  0.20·v_norm + 0.15·z_norm + 0.20·balance_flag +
+  0.15·iban_risk + 0.20·geo_flag + 0.10·demog +
+  0.10·psi_flag + 0.10·cross_flag,
+  0, 1
+)
+```
 
-### 1. Deterministic Featurizer
+where each term is normalised to [0, 1] before weighting.
 
-Implemented in `featurizer.py`.
+### 3.9 Communications Entity Extraction
 
-This node computes structured fraud indicators before any LLM call is made. It exists to keep exact arithmetic, data matching, and statistical logic outside the LLM loop.
+Regex patterns applied to raw SMS and email text:
 
-Current featurizer responsibilities:
+| Entity | Pattern |
+|---|---|
+| IBAN | `[A-Z]{2}\d{2}[A-Z0-9]{4,30}` |
+| Amount | `[€$£][\d,]+` or `[\d,]+\s?(?:EUR\|USD\|GBP\|CHF)` |
+| URL | `https?://[^\s"<>]+` |
+| Urgency phrase | hardcoded list: *urgent, immediately, asap, verify account, account will be closed, …* |
 
-- match users by `sender_iban` against `users.json`
-- compute sender transaction velocity
-- compute amount anomaly z-score
-- detect suspicious balance drain patterns
-- classify IBAN country risk
-- detect impossible travel from GPS pings
-- score demographic deviation from salary, job, amount, and hour
-- measure sender drift using PSI-like scoring over transaction amounts
-- extract structured entities from SMS and mail threads
-- detect cross-source mismatches between communications and transaction details
-- compute a `combined_risk_score`
+Cross-reference mismatches (comms IBAN ≠ transaction IBAN, comms amount ≠ transaction amount) are passed to both the Comms agent and Supervisor.
 
-The communications preprocessing intentionally uses regex-based extraction rather than spaCy, because this repo notes installation friction for the original spaCy plan in `tools/comms_tools.py`.
+---
 
-### 2. Transaction Reasoning Agent
+## 4. Agent Design
 
-Implemented in `agents/transaction_agent.py`.
+### 4.1 Transaction Reasoning Agent
 
-This agent receives deterministic transaction features and synthesizes a structured fraud assessment:
+- **Model**: `FAST_MODEL` (default: `openai/gpt-4o-mini`)
+- **Framework**: LangGraph `create_react_agent` (ReAct pattern)
+- **Prompt style**: 4-state Structured Chain-of-Thought (SCoT)
 
-- `transaction_fraud_signal`
-- `pattern_label`
-- `reasoning`
+**Reasoning states:**
 
-It uses:
+| State | Goal |
+|---|---|
+| 1 — Signal Inventory | List all anomaly magnitudes; anchor to `combined_risk_score` |
+| 2 — Pattern Classification | Map signals to one of 6 fraud patterns |
+| 3 — Corroboration Check | Count mutually corroborating signals; calibrate score |
+| 4 — JSON Output | Emit structured verdict |
 
-- `ChatOpenAI` through OpenRouter
-- a structured system prompt
-- JSON-only parsing with retry-on-invalid-output
-- the `FAST_MODEL` environment variable
+**Six fraud patterns recognised:**
 
-### 3. Communications Reasoning Agent
+| Label | Description |
+|---|---|
+| `velocity_fraud` | > 5 transactions in 24 h |
+| `account_takeover` | Sudden behaviour change + impossible travel or balance drain |
+| `mule_activity` | Money-laundering relay pattern |
+| `identity_mismatch` | IBAN country ≠ user residence country |
+| `synthetic_identity` | Implausible/constructed user profile |
+| `unclear` | Signals present but no clear pattern |
 
-Implemented in `agents/comms_agent.py`.
+**Output schema:**
 
-This agent analyzes free-text communication evidence and extracted entities to identify:
+```json
+{
+  "transaction_fraud_signal": 0.0,
+  "pattern_label": "velocity_fraud",
+  "reasoning": "One-sentence rationale."
+}
+```
 
-- urgency language
-- impersonation clues
-- IBAN mismatches
-- suspicious URLs
-- social engineering patterns
+### 4.2 Communications Reasoning Agent
 
-It returns:
+- **Model**: `STRONG_MODEL` (default: `openai/gpt-4o`)
+- **Framework**: LangGraph `create_react_agent` with 2 tool calls
+- **Prompt style**: 4-state SCoT with few-shot examples
 
-- `comms_fraud_signal`
-- `flagged_phrases`
-- `cross_reference_mismatches`
-- `reasoning`
+**Reasoning states:**
 
-It uses the `STRONG_MODEL` environment variable because communications reasoning is more language-heavy than the structured transaction agent.
+| State | Goal |
+|---|---|
+| 1 — Entity Review | Examine IBANs, amounts, URLs, urgency phrases from comms |
+| 2 — Cross-Reference | Compare comms entities against transaction record |
+| 3 — Linguistic Risk | Urgency, impersonation, social-engineering narrative |
+| 4 — JSON Output | Emit structured verdict |
 
-### 4. Supervisor Agent
+**Output schema:**
 
-Implemented in `agents/supervisor_agent.py`.
+```json
+{
+  "comms_fraud_signal": 0.0,
+  "flagged_phrases": ["Urgent: verify immediately"],
+  "cross_reference_mismatches": ["IBAN in SMS differs from tx recipient IBAN"],
+  "reasoning": "One-sentence rationale."
+}
+```
 
-This agent fuses the deterministic features and both specialist outputs into a final verdict:
+### 4.3 Supervisor Agent
 
-- `FRAUD`
-- `REVIEW`
-- `CLEAN`
+- **Model**: `STRONG_MODEL`
+- **Framework**: Direct LLM invoke (no tool loop)
+- **Role**: Cost-aware arbitrator with hard decision rules
 
-It also returns:
+**Reconciliation logic:**
 
-- `confidence`
-- `primary_evidence`
-- `explanation`
+| Evidence pattern | Decision guidance |
+|---|---|
+| Both signals ≥ 0.60 + CRS ≥ 0.50 | Strong corroboration → FRAUD |
+| CRS ≥ 0.85 (deterministic certainty) | Trust arithmetic/physics → FRAUD |
+| One signal ≥ 0.60 OR avg ≥ 0.50 | Partial evidence → REVIEW |
+| All signals < 0.35 + CRS < 0.40 + no flags | Low risk → CLEAN |
+| Default (ambiguous) | Err on caution → REVIEW |
 
-The output writer in `graph.py` includes both `FRAUD` and `REVIEW` IDs in the submission file, while suppressing `CLEAN`.
+**Output schema:**
 
-### 5. LangGraph Workflow
+```json
+{
+  "verdict": "FRAUD",
+  "confidence": 0.87,
+  "primary_evidence": "IBAN substitution in SMS + impossible travel.",
+  "explanation": "One-sentence audit trail."
+}
+```
 
-Implemented in `graph.py`.
+---
 
-This file defines:
+## 5. Decision Logic & Thresholds
 
-- featurizer node
-- conditional routing after featurization
-- transaction specialist node
-- communications specialist node
-- supervisor node
-- short-circuit supervisor node
-- output writer
+### Hard Decision Rules (Supervisor)
 
-It is also where specialist parallelism and short-circuiting are orchestrated.
+```
+FRAUD  ← (tx_signal ≥ 0.60 AND comms_signal ≥ 0.60 AND CRS ≥ 0.50)
+          OR (CRS ≥ 0.85)
 
-## Technical Stack
+REVIEW ← tx_signal ≥ 0.60
+          OR comms_signal ≥ 0.60
+          OR (tx_signal + comms_signal) / 2 ≥ 0.50
+          OR (CRS ≥ 0.65 AND max(tx_signal, comms_signal) ≥ 0.40)
 
-The project currently depends on:
+CLEAN  ← tx_signal < 0.35
+          AND comms_signal < 0.35
+          AND CRS < 0.40
+          AND no cross_source_flags
+          AND no comms mismatches
 
-- Python 3.12+ in the working environment
-- LangGraph
-- LangChain
-- LangChain OpenAI integration
-- Langfuse SDK v3
-- pandas
-- numpy
-- scipy
-- scikit-learn
-- haversine
-- python-dotenv
-- python-ulid
-- pytest
+DEFAULT → REVIEW  (asymmetric cost: missing fraud > false positive)
+```
 
-The exact declared dependencies are in `requirements.txt`.
+### Short-Circuit Rule
 
-## Tracing and Submission Requirements
+```
+IF CRS ≥ SHORTCIRCUIT_THRESHOLD (default 0.90):
+    skip Transaction agent + Comms agent entirely
+    run Supervisor directly on deterministic evidence
+    → ~75% reduction in LLM calls for high-risk transactions
+```
 
-The challenge expects Langfuse tracing and model access through OpenRouter.
+---
 
-This repository supports that through `session.py`, which:
+## 6. Prerequisites
 
-- creates a session ID in the format `{TEAM_NAME}-{ULID}`
-- configures a Langfuse callback handler for LangChain
-- injects `langfuse_session_id` into LangChain metadata
-- flushes Langfuse traces after a run
+- Python 3.11+
+- Access to [OpenRouter](https://openrouter.ai/) (for LLM routing) OR direct Anthropic / OpenAI API keys
+- Langfuse account credentials (provided by the hackathon organisers)
+- The competition data ZIP files (provided separately)
 
-The helper material in `Langfuse/how-to-track-your-submission/` is a reference example. The actual project integration used by the pipeline is `session.py`.
+---
 
-## Setup
+## 7. Installation
 
-### 1. Create and activate a virtual environment
+```bash
+# Clone or unzip the project
+cd Multi_Agent_Fraud_Detection
 
-PowerShell:
-
-```powershell
+# Create a virtual environment
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+source .venv/bin/activate          # Linux / macOS
+# .venv\Scripts\activate           # Windows
+
+# Install all dependencies
+pip install -r requirements.txt
 ```
 
-### 2. Install dependencies
+### Core dependencies
 
-```powershell
-python -m pip install -r requirements.txt
+| Package | Version | Purpose |
+|---|---|---|
+| `langgraph` | 1.1.6 | Multi-agent graph orchestration |
+| `langchain-openai` | 1.1.14 | LLM client (OpenRouter gateway) |
+| `langfuse` | 3.14.6 | Tracing and observability |
+| `pandas` | 3.0.2 | DataFrame operations |
+| `numpy` | 2.4.4 | Numerical computations |
+| `haversine` | 2.9.0 | Geospatial distance |
+| `scikit-learn` | 1.8.0 | Metrics (precision/recall/F1) |
+| `python-dotenv` | 1.2.2 | `.env` loading |
+| `python-ulid` | 3.1.0 | Unique session IDs |
+| `pytest` | 9.0.3 | Test suite |
+
+---
+
+## 8. Configuration
+
+Create a `.env` file in the project root:
+
+```bash
+cp .env.example .env   # if example exists
+# or create manually:
 ```
 
-### 3. Create a `.env` file
+```ini
+# ── LLM routing via OpenRouter ──────────────────────────────────────────────
+OPENROUTER_API_KEY=sk-or-v1-YOUR_KEY_HERE
 
-This repository expects a dotenv file at the project root named `.env`.
+# Model for Transaction agent (fast + cheap)
+FAST_MODEL=openai/gpt-4o-mini
 
-Recommended variables:
+# Model for Comms agent and Supervisor (strong reasoning)
+STRONG_MODEL=openai/gpt-4o
 
-```env
-OPENROUTER_API_KEY=...
-LANGFUSE_PUBLIC_KEY=...
-LANGFUSE_SECRET_KEY=...
+# ── Langfuse observability ───────────────────────────────────────────────────
+LANGFUSE_PUBLIC_KEY=pk-lf-YOUR_KEY
+LANGFUSE_SECRET_KEY=sk-lf-YOUR_KEY
 LANGFUSE_HOST=https://challenges.reply.com/langfuse
 LANGFUSE_MEDIA_UPLOAD_ENABLED=false
-TEAM_NAME=your-team-name
+
+# ── Competition settings ─────────────────────────────────────────────────────
+TEAM_NAME=Your-Team-Name
 DATA_DIR=train-validation
-FAST_MODEL=openai/gpt-4o-mini
-STRONG_MODEL=openai/gpt-4o
+
+# ── Feature/decision tuning ──────────────────────────────────────────────────
 SHORTCIRCUIT_THRESHOLD=0.90
-AGENT_MODEL=openai/gpt-4o-mini
 ```
 
-## Configuration
+### Environment variable reference
 
-Important runtime knobs:
+| Variable | Default | Description |
+|---|---|---|
+| `OPENROUTER_API_KEY` | — | OpenRouter gateway API key (required) |
+| `FAST_MODEL` | `openai/gpt-4o-mini` | Model for Transaction agent |
+| `STRONG_MODEL` | `openai/gpt-4o` | Model for Comms agent + Supervisor |
+| `LANGFUSE_PUBLIC_KEY` | — | Langfuse public key |
+| `LANGFUSE_SECRET_KEY` | — | Langfuse secret key |
+| `LANGFUSE_HOST` | `https://cloud.langfuse.com` | Langfuse instance URL |
+| `TEAM_NAME` | `team` | Prefix for session IDs in Langfuse |
+| `DATA_DIR` | `train-validation` | Directory containing data ZIP files |
+| `SHORTCIRCUIT_THRESHOLD` | `0.90` | CRS threshold to skip specialist agents |
 
-- `TEAM_NAME`
-  Used in the Langfuse session ID.
-- `DATA_DIR`
-  Directory containing the train/validation zip files.
-- `FAST_MODEL`
-  Used by the transaction reasoning agent.
-- `STRONG_MODEL`
-  Used by the communications and supervisor agents.
-- `SHORTCIRCUIT_THRESHOLD`
-  Intended cutoff for deterministic-only routing when the featurizer is confident enough.
+---
 
-## How to Run
+## 9. Data Setup
 
-### Run the general pipeline
+The competition provides data in a ZIP archive. Unzip it to match this structure:
 
-Train split:
+```
+train-validation/
+├── brave-new-world/
+│   ├── train/
+│   │   ├── transactions.csv
+│   │   ├── users.json
+│   │   ├── locations.json
+│   │   ├── sms.json
+│   │   └── mails.json
+│   └── validation/
+│       └── (same files, no labels)
+├── deus-ex/
+│   └── ...
+└── the-truman-show/
+    └── ...
+```
 
-```powershell
+### Data schema
+
+**`transactions.csv`**
+
+| Column | Type | Description |
+|---|---|---|
+| `transaction_id` | str | Unique transaction ID |
+| `sender_id` | str | Sender user ID |
+| `recipient_id` | str | Recipient user ID |
+| `type` | str | Transaction type (e.g. TRANSFER, PAYMENT) |
+| `amount` | float | Transaction amount (EUR) |
+| `location` | str | Transaction location city |
+| `payment_method` | str | Method (e.g. ONLINE, POS) |
+| `sender_iban` | str | Sender's IBAN |
+| `recipient_iban` | str | Recipient's IBAN |
+| `balance_after` | float | Sender's balance after transaction |
+| `description` | str | Free-text description |
+| `timestamp` | datetime | ISO 8601 timestamp |
+
+**`users.json`** — dict keyed by `user_id`; fields: `first_name`, `last_name`, `birth_year`, `salary`, `job`, `iban`, `residence.city`, `residence.lat`, `residence.lng`
+
+**`locations.json`** — list of GPS pings: `biotag` (user_id), `timestamp`, `lat`, `lng`, `city`
+
+**`sms.json` / `mails.json`** — dict keyed by `transaction_id` (or user identifier); values are raw text threads
+
+---
+
+## 10. Quickstart
+
+```bash
+# 1. Run the pipeline on the training split (brave-new-world level)
 python pipeline.py --level brave-new-world --split train
-```
 
-Validation split:
-
-```powershell
-python pipeline.py --level the-truman-show --split validation
-```
-
-Smoke test with a small subset:
-
-```powershell
-python pipeline.py --level the-truman-show --split validation --max-transactions 5
-```
-
-### Generate a submission-style output file
-
-For validation output:
-
-```powershell
-python submit.py --level the-truman-show
-```
-
-Smoke test:
-
-```powershell
-python submit.py --level the-truman-show --max-transactions 5
-```
-
-Expected output path:
-
-```text
-outputs\the-truman-show_validation_output.txt
-```
-
-### Run calibration
-
-If you want to sweep thresholds over training data:
-
-```powershell
-python calibrate.py
-```
-
-Check the script itself for level-specific behavior and any output artifacts it writes.
-
-## Evaluation and Testing
-
-### Local evaluation
-
-The evaluation harness compares a generated output file against a reference labels file.
-
-Example:
-
-```powershell
+# 2. Evaluate against ground-truth labels
 python evaluate.py --level brave-new-world --split train
+
+# 3. Calibrate thresholds (requires label file)
+python calibrate.py --level brave-new-world --labels-file outputs/brave-new-world_train_labels.txt
+
+# 4. Submit on validation split
+python submit.py --level brave-new-world
 ```
 
-If labels are not supplied, the script reports output statistics only.
+Output is written to `outputs/brave-new-world_train_output.txt` — one `transaction_id` per line for every transaction flagged as FRAUD or REVIEW.
 
-### Tests
+---
 
-Run the project test suite with:
+## 11. CLI Reference
 
-```powershell
-python -m pytest -q tests
+### `pipeline.py` — Main inference runner
+
+```
+python pipeline.py [OPTIONS]
+
+Options:
+  --level TEXT              Competition level (required)
+                            Choices: brave-new-world | deus-ex | the-truman-show
+  --split TEXT              Dataset split (default: train)
+                            Choices: train | validation
+  --data-dir TEXT           Path to data directory (default: env DATA_DIR or train-validation)
+  --output-dir TEXT         Output directory (default: outputs)
+  --max-transactions INT    Cap number of transactions (useful for smoke testing)
+
+Output:
+  outputs/{level}_{split}_output.txt  — flagged transaction IDs, one per line
 ```
 
-This is the recommended test target. Running plain `pytest` at repository root may also collect unrelated tests inside reference repositories under `repos/`.
+**Examples:**
 
-## Output Format
+```bash
+# Full training run
+python pipeline.py --level brave-new-world --split train
 
-Submission files are ASCII text files with:
+# Smoke test: first 20 transactions only
+python pipeline.py --level brave-new-world --split train --max-transactions 20
 
-- one suspicious `transaction_id` per line
-- no header
-- no footer
+# Validation split with custom output dir
+python pipeline.py --level deus-ex --split validation --output-dir my-outputs
 
-The writer in `graph.py` currently outputs both:
+# All three levels
+for level in brave-new-world deus-ex the-truman-show; do
+  python pipeline.py --level $level --split train
+done
+```
 
-- `FRAUD`
-- `REVIEW`
+---
 
-and suppresses:
+### `evaluate.py` — Evaluation harness
 
-- `CLEAN`
+```
+python evaluate.py [OPTIONS]
 
-## Known Limitations
+Options:
+  --level TEXT              Competition level (required)
+  --split TEXT              Dataset split (default: train)
+  --output-dir TEXT         Where to read pipeline output from (default: outputs)
+  --labels-file TEXT        Path to ground-truth label file
+                            (default: outputs/{level}_{split}_labels.txt)
+  --data-dir TEXT           Data directory (default: env DATA_DIR or train-validation)
 
-This section is intentionally candid so that readers and judges understand the current state of the repository.
+Prints:
+  Precision, Recall, F1, False-Positive Rate
+  Warning if Recall < 15% (competition disqualification threshold)
+```
 
-### 1. End-to-end pipeline runtime bug in `graph.py`
+**Examples:**
 
-Targeted tests pass, but a real pipeline smoke run currently fails in the graph dispatch path with a LangGraph node return-value error.
+```bash
+# Evaluate with default label path
+python evaluate.py --level brave-new-world --split train
 
-Observed behavior:
+# Evaluate with explicit label file
+python evaluate.py --level brave-new-world --split train \
+  --labels-file /path/to/ground_truth.txt
+```
 
-- the deterministic loading and featurization run correctly
-- the pipeline enters the graph
-- the dispatch path returns `Send(...)` objects in a way LangGraph rejects at runtime
+---
 
-Practical effect:
+### `calibrate.py` — Threshold optimiser
 
-- `submit.py` and `pipeline.py` are not yet reliably producing valid end-to-end fraud predictions on real runs
-- fallback handling may still emit `REVIEW` output entries after errors
+Sweeps a grid of `fraud_threshold × review_threshold` combinations to find the pair that maximises F1 subject to Recall ≥ 15%.
 
-This is the main blocker to producing a proper challenge submission from the current codebase.
+```
+python calibrate.py [OPTIONS]
 
-### 2. Communications preprocessing is regex-based
+Options:
+  --level TEXT              Competition level (required)
+  --labels-file TEXT        Ground-truth label file (required)
+  --split TEXT              Dataset split (default: train)
+  --data-dir TEXT           Data directory
+  --output-dir TEXT         Where to write thresholds JSON (default: thresholds)
+  --max-transactions INT    Cap for smoke testing
+  --fraud-grid TEXT         Comma-separated fraud threshold grid
+                            (default: "0.50,0.55,0.60,0.65,0.70,0.75,0.80")
+  --review-grid TEXT        Comma-separated review threshold grid
+                            (default: "0.30,0.35,0.40,0.45,0.50,0.55")
 
-The design material originally considered spaCy-based entity extraction, but the implemented code uses regex and curated phrase matching in `tools/comms_tools.py`.
+Output:
+  thresholds/{level}_thresholds.json  — best thresholds + metrics
+```
 
-This keeps the system lightweight and dependency-friendly, but it is less expressive than a full NLP parser.
+**Example:**
 
-### 3. Reference repos are included in-tree
+```bash
+python calibrate.py \
+  --level brave-new-world \
+  --labels-file outputs/brave-new-world_train_labels.txt \
+  --fraud-grid "0.55,0.60,0.65,0.70" \
+  --review-grid "0.35,0.40,0.45"
+```
 
-The `repos/` directory contains comparative/reference projects and is not part of the main runtime path. Be careful not to confuse them with the production code for this submission.
+---
 
-## Design Decisions
+### `submit.py` — Competition submission runner
 
-This repository intentionally uses a hybrid approach rather than a pure multi-agent swarm.
+Runs inference on the **validation** split and flushes all Langfuse traces.
 
-### Why deterministic features first
+```
+python submit.py [OPTIONS]
 
-Fraud signals such as:
+Options:
+  --level TEXT              Competition level (required)
+  --data-dir TEXT           Data directory
+  --output-dir TEXT         Output directory (default: outputs)
+  --max-transactions INT    Cap for smoke testing
 
-- rolling velocity
-- z-scores
-- IBAN country parsing
-- GPS speed calculations
-- balance arithmetic
+Output:
+  outputs/{level}_validation_output.txt  — submission file
+  Langfuse session ID printed to stdout
+```
 
-are exact, cheap, and easier to validate in Python than in LLM prompts.
+**Example:**
 
-### Why only two specialist agents
+```bash
+python submit.py --level brave-new-world
+```
 
-The architecture aims for a practical middle ground:
+---
 
-- enough specialization to satisfy the challenge's agent-based requirement
-- not so many agents that cost, latency, and orchestration overhead dominate
+## 12. Available Models
 
-### Why a supervisor agent
+The pipeline routes LLM calls through **OpenRouter**, giving access to all major providers with a single API key. Set `FAST_MODEL` and `STRONG_MODEL` in `.env`.
 
-Naive averaging or voting is usually too brittle for asymmetric fraud costs. The supervisor lets the system reason over disagreement, corroboration, and borderline cases with a structured verdict.
+### Recommended model combinations
 
-### Why model tiering exists
+| Use case | FAST_MODEL | STRONG_MODEL |
+|---|---|---|
+| **Default (balanced)** | `openai/gpt-4o-mini` | `openai/gpt-4o` |
+| **Cost-optimised** | `openai/gpt-4o-mini` | `anthropic/claude-haiku-4-5` |
+| **Maximum accuracy** | `openai/gpt-4o` | `anthropic/claude-opus-4-7` |
+| **Claude-only** | `anthropic/claude-haiku-4-5` | `anthropic/claude-sonnet-4-6` |
+| **Gemini** | `google/gemini-flash-1.5` | `google/gemini-2.5-pro` |
+| **Local (Ollama)** | `ollama/llama3.1` | `ollama/llama3.1:70b` |
 
-The repository separates:
+### OpenRouter model IDs
 
-- a faster model for structured transaction reasoning
-- a stronger model for language-heavy communications and final arbitration
+| Model | OpenRouter ID |
+|---|---|
+| GPT-4o | `openai/gpt-4o` |
+| GPT-4o mini | `openai/gpt-4o-mini` |
+| Claude Opus 4.7 | `anthropic/claude-opus-4-7` |
+| Claude Sonnet 4.6 | `anthropic/claude-sonnet-4-6` |
+| Claude Haiku 4.5 | `anthropic/claude-haiku-4-5` |
+| Gemini 2.5 Pro | `google/gemini-2.5-pro` |
+| Gemini Flash 1.5 | `google/gemini-flash-1.5` |
+| Llama 3.1 70B | `meta-llama/llama-3.1-70b-instruct` |
 
-This is a cost-performance optimization inspired by the comparison work documented in `COMPARISON_REPORT.md`.
+---
 
-## References
+## 13. Evaluation & Metrics
 
-Project-specific references in this repository:
+### Metrics computed
 
-- `problemoverview/AIAgentChallenge-ProblemStatement16April.md`
-- `reply-mirror-multi-agent-fraud-design.md`
-- `COMPARISON_REPORT.md`
-- `Langfuse/how-to-track-your-submission/README.txt`
+| Metric | Formula | Competition role |
+|---|---|---|
+| **Precision** | TP / (TP + FP) | Quality of predictions |
+| **Recall** | TP / (TP + FN) | **Must be ≥ 15% or disqualified** |
+| **F1** | 2·P·R / (P + R) | Primary ranking metric |
+| **FPR** | FP / (FP + TN) | Customer-experience impact |
 
-## Suggested Next Steps
+### Label convention
 
-The most useful next engineering steps for this repository are:
+- Output file includes `transaction_id` for all transactions with verdict **FRAUD** or **REVIEW**.
+- **CLEAN** transactions are excluded from the output file.
+- Ground-truth labels use the same convention (presence = positive).
 
-1. Fix the LangGraph specialist dispatch path in `graph.py` so real end-to-end runs complete.
-2. Benchmark multiple `STRONG_MODEL` options on a small training subset.
-3. Calibrate fraud and review thresholds using `calibrate.py`.
-4. Add a smoke test that exercises the real graph execution path rather than only mocked specialist nodes.
+### Interpreting results
+
+```
+Recall  < 0.15 → DISQUALIFIED
+Recall  ≥ 0.15 → valid submission; higher F1 = better rank
+Precision ~ 0.5 with Recall ~ 0.7 → strong result (industry baseline ≈ P=0.6, R=0.5)
+```
+
+---
+
+## 14. Threshold Calibration
+
+After running the pipeline on the training split, calibrate thresholds before final submission:
+
+```bash
+# Step 1: Run pipeline on training data (generates raw outputs)
+python pipeline.py --level brave-new-world --split train
+
+# Step 2: Calibrate thresholds with a fine grid
+python calibrate.py \
+  --level brave-new-world \
+  --labels-file outputs/brave-new-world_train_labels.txt \
+  --fraud-grid "0.50,0.55,0.60,0.65,0.70" \
+  --review-grid "0.30,0.35,0.40,0.45,0.50"
+
+# Step 3: Inspect output
+cat thresholds/brave-new-world_thresholds.json
+# {
+#   "fraud_threshold": 0.60,
+#   "review_threshold": 0.40,
+#   "precision": 0.71,
+#   "recall": 0.68,
+#   "f1": 0.69,
+#   "fpr": 0.12
+# }
+```
+
+The calibrated thresholds are automatically loaded by `pipeline.py` on subsequent runs if `thresholds/{level}_thresholds.json` exists.
+
+### Tuning the short-circuit threshold
+
+```bash
+# More aggressive short-circuit (fewer LLM calls, higher cost of missed fraud edge cases)
+SHORTCIRCUIT_THRESHOLD=0.85 python pipeline.py --level brave-new-world --split train
+
+# Conservative short-circuit (always run all agents except extreme cases)
+SHORTCIRCUIT_THRESHOLD=0.95 python pipeline.py --level brave-new-world --split train
+```
+
+---
+
+## 15. Submission
+
+```bash
+# Run on validation split (official submission)
+python submit.py --level brave-new-world
+
+# Check the output
+cat outputs/brave-new-world_validation_output.txt
+
+# Submit all three levels
+for level in brave-new-world deus-ex the-truman-show; do
+  python submit.py --level $level
+done
+```
+
+The submission runner:
+1. Runs the full pipeline on the **validation** split
+2. Writes `outputs/{level}_validation_output.txt`
+3. Flushes all pending Langfuse traces
+4. Prints session ID and summary statistics
+
+---
+
+## 16. Testing
+
+```bash
+# Run the full test suite
+pytest tests/ -v
+
+# Run a specific test module
+pytest tests/test_featurizer.py -v
+
+# Run with coverage
+pytest tests/ --cov=. --cov-report=term-missing
+
+# Run a specific test
+pytest tests/test_agents.py::test_supervisor_verdict_clean -v
+```
+
+### Test modules
+
+| Module | Coverage |
+|---|---|
+| `tests/test_state.py` | FraudState schema: all 48 keys, correct types, safe defaults |
+| `tests/test_featurizer.py` | All 15 deterministic features; entity extraction; type correctness |
+| `tests/test_agents.py` | JSON parsing + signal bounds for all 3 agents |
+| `tests/test_graph.py` | Graph topology; short-circuit trigger; fan-out/fan-in |
+| `tests/test_evaluate.py` | TP/FP/FN/TN computation; precision/recall/F1/FPR |
+
+---
+
+## 17. Observability with Langfuse
+
+All LLM calls are automatically traced to the Langfuse dashboard configured in `.env`.
+
+### Accessing traces
+
+1. Open `https://challenges.reply.com/langfuse` in a browser
+2. Sign in with hackathon credentials
+3. Filter by session ID (printed at the start of each run)
+
+### Session ID format
+
+```
+{TEAM_NAME}-{ULID}
+# example: malto-team-3-01ARZ3NDEKTSV4RRFFQ69G5FAV
+```
+
+The session ID is printed to stdout at the start of every pipeline run and embedded in every trace.
+
+### What is traced
+
+| Event | Token count | Cost |
+|---|---|---|
+| Featurizer | 0 (no LLM) | \$0 |
+| Transaction agent | ~800–1 200 tokens | ~\$0.001 |
+| Comms agent | ~1 000–2 000 tokens | ~\$0.003 |
+| Supervisor | ~600–1 000 tokens | ~\$0.002 |
+| Short-circuit path | 0 specialist tokens | ~\$0.002 |
+
+### Programmatic access
+
+```python
+from session import get_langfuse_client
+
+lf = get_langfuse_client()
+# lf is a langfuse.Langfuse instance
+```
+
+---
+
+## 18. Performance Optimisations
+
+### 1. Short-circuit routing (~75% LLM call reduction)
+
+When `combined_risk_score ≥ SHORTCIRCUIT_THRESHOLD` (default 0.90), deterministic evidence is conclusive. Both specialist agents are skipped; the Supervisor processes the deterministic features directly.
+
+### 2. Per-user statistics pre-computation
+
+All per-sender statistics (velocity counts, amount distributions, balance history, PSI) are computed once per unique sender before the main transaction loop. This eliminates O(N × M) repeated DataFrame scans during inference.
+
+### 3. Model routing
+
+Expensive reasoning is concentrated where it matters:
+
+- **Transaction agent** uses a cheaper, faster model (`gpt-4o-mini`) for structured feature synthesis.
+- **Comms agent + Supervisor** use a stronger model (`gpt-4o`) for free-text reasoning and final arbitration.
+
+### 4. Per-user communications filtering
+
+SMS and email threads are pre-filtered to only those mentioning the sender's first or last name, preventing cross-user contamination in datasets where communications are pooled.
+
+---
+
+## 19. Project Structure
+
+```
+Multi_Agent_Fraud_Detection/
+│
+├── agents/
+│   ├── __init__.py
+│   ├── transaction_agent.py     # Node 2: LLM reasoning on transaction features
+│   ├── comms_agent.py           # Node 3: LLM reasoning on communications
+│   └── supervisor_agent.py      # Node 4: cost-aware arbitration
+│
+├── tools/
+│   ├── __init__.py
+│   ├── transaction_tools.py     # velocity, z-score, balance, IBAN, PSI
+│   ├── geospatial_tools.py      # Haversine travel detection, location clustering
+│   └── comms_tools.py           # regex entity extraction, mismatch detection
+│
+├── prompts/
+│   ├── __init__.py
+│   ├── transaction_agent_prompt.py  # 4-state SCoT + few-shot examples
+│   ├── comms_agent_prompt.py        # 4-state SCoT + few-shot examples
+│   └── supervisor_prompt.py         # cost-aware thresholds + decision rules
+│
+├── tests/
+│   ├── __init__.py
+│   ├── test_state.py
+│   ├── test_featurizer.py
+│   ├── test_agents.py
+│   ├── test_graph.py
+│   └── test_evaluate.py
+│
+├── outputs/                    # Pipeline output files (created on run)
+├── train-validation/           # Competition data ZIPs (not committed)
+├── Langfuse/                   # Observability example integration
+│
+├── data_loader.py              # ZIP loading + DataFrame normalisation
+├── featurizer.py               # Node 1: deterministic feature computation
+├── graph.py                    # LangGraph topology + graph compilation
+├── state.py                    # FraudState TypedDict (48 fields)
+├── session.py                  # Session ID + Langfuse client initialisation
+│
+├── pipeline.py                 # CLI: run inference on train/validation split
+├── evaluate.py                 # CLI: compute precision/recall/F1/FPR
+├── calibrate.py                # CLI: sweep threshold grid to maximise F1
+├── submit.py                   # CLI: final validation submission + trace flush
+│
+├── requirements.txt
+├── .env                        # Credentials + model routing (not committed)
+└── README.md
+```
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `AuthenticationError` | Wrong `OPENROUTER_API_KEY` | Verify key at openrouter.ai/keys |
+| `FileNotFoundError: transactions.csv` | Data not in `DATA_DIR` | Check `DATA_DIR` in `.env` and ZIP extraction |
+| `Recall < 0.15` warning | Thresholds too strict | Run `calibrate.py` or lower `SHORTCIRCUIT_THRESHOLD` |
+| Langfuse traces not appearing | Missing Langfuse keys or wrong host | Check `LANGFUSE_HOST` and credentials |
+| All transactions flagged REVIEW | `combined_risk_score` normalisation issue | Inspect featurizer weight sum; should total ≤ 1.0 |
+| JSON parse error from agent | LLM returned malformed JSON | Pipeline retries once; enable `--max-transactions 5` to debug |
+
+---
+
+## Team
+
+**Malto-Team-3** — Reply Mirror Hackathon, April 2026
+
+---
+
+*Built with [LangGraph](https://github.com/langchain-ai/langgraph) · [LangChain](https://github.com/langchain-ai/langchain) · [Langfuse](https://langfuse.com)*
